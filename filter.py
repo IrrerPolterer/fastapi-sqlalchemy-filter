@@ -16,17 +16,30 @@ from sqlalchemy.orm import DeclarativeBase, Mapper
 
 @dataclasses.dataclass(frozen=True)
 class Operator:
-    description: str  # for documentation
-    suffix: str  # for parameter name & alias
-    supported_type: Type  # to check sqlalchemy column compatibility
-    compare_func: Callable[[Column, Any], Any]  # to filter select statements
+    """
+    Filter Operator, describing a filter operation.
 
-    unsupported_type: Type | None = None  # exclude columns of this type
-    input_type: Type | None = None  # enforce input type, else use column type
+    Attributes:
+    - `description` is used for the auto-generated openapi documentation.
+    - `suffix` is the shorthand for this filter operation, used to name the resulting query parameters.
+    - `supported_type` is the type (or Union of types) which support this filter operation. This identifies which columns of the data model support this filter operation.
+    - `unsupported_type` is the type (or Union of types) which do not support this filter operation. This helps narrow down the exact data types that support this filter operation in situations with inherited types.
+    - `input_type` can be used to force a parameter input type for this filter operation. If unset, the query parameter assumes the data type of the associated data model column.
+    """
+
+    description: str
+    suffix: str
+    supported_type: Type
+    compare_func: Callable[[Column, Any], Any]
+
+    # optional attributes
+    unsupported_type: Type = None
+    input_type: Type = None
 
     def supports_column(self, column: Column) -> bool:
         """
-        Returns `True` if given type is supported by this operator.
+        Returns `True` if given sqlalchemy column object can be filtered with this operator.
+        This classification is based entirely on the `supported_type` and `unsupported_type` of the operator.
         """
         column_type = column.type.python_type
 
@@ -113,16 +126,14 @@ OPERATORS = (
 @dataclasses.dataclass(frozen=True)
 class FilterOption:
     """
-    Class representing a filter option, which is generated from a sqlalchemy model.
+    Filter option, representing a possible filtering parameter for a given data model.
+    They associate columns of an sqlalchemy data model with applicable filter operations.
+
+    Appropriate fastapi query parameters can be declared using the `query_parameter()` method.
     """
 
-    # associated sqlalchemy column
     column: Column
-
-    # associated filter operator
     operator: Operator
-
-    # chain of relationships (names) parenting the sqlalchemy column
     relationship_chain: Iterable[str] = ()
 
     @property
@@ -177,39 +188,40 @@ class FilterOption:
         """
         return f"{self.column_alias}[{self.operator.suffix}]"
 
-    @property
-    def field_type(self) -> Type:
+    def input_type(self) -> Type:
         """
-        Valid input types for this filter option query parameter.
+        Returns the valid input type for this filter option.
         """
+
+        # assume column data type by default
         input_type = self.column.type.python_type
 
         if self.operator.input_type:
+            # use operator input type it's explicitly specified
             input_type = self.operator.input_type
 
             if input_type == list:
+                # in case of explicit lists, specify type of list based on column type
                 input_type = List[self.column.type.python_type]
 
         return input_type | None
 
-    @property
-    def field_info(self) -> FieldInfo:
+    def query_parameter(self) -> FieldInfo:
         """
-        Pydantic Field data for this filter optoin query parameter.
+        Returns the fastapi query parameter for this filter option.
         """
-        return Field(
-            Query(
-                None,
-                alias=self.alias,
-                title=f"Filter: `{self.alias}`",
-                description=f"Filter results by `{self.column_alias}` using *{self.operator.description}* comparison.",
-            )
+        return Query(
+            None,
+            alias=self.alias,
+            title=f"Filter: `{self.alias}`",
+            description=f"Filter results by `{self.column_alias}` using *{self.operator.description}* comparison.",
         )
 
 
 class FilterOptions(List[FilterOption]):
     """
     Collection of `FilterOption` objects.
+    This class provides a constructor to conveniently generate appropriate filter options for a given sqlalchemy data model.
     """
 
     def __init__(
@@ -371,8 +383,8 @@ class FilterOptions(List[FilterOption]):
 
 class Filter(BaseModel):
     """
-    Filter class, containing dynamically generated pydantic fields for filter values.
-    Includes an `apply` method to add appropriate filter statements to an sqlalchemy `Select` object.
+    Filter class, containing dynamically generated fields for query parameters.
+    Can `apply()` filter statements to an sqlalchemy `Select` object.
     """
 
     __filter_options__: FilterOptions | list = []  # stub
@@ -407,7 +419,7 @@ class Filter(BaseModel):
         include: str | Iterable[str] = (),
         exclude: str | Iterable[str] = (),
         include_related: Iterable[str] = (),
-    ) -> Type["Filter"]:
+    ) -> Type[Filter]:
         """
         Dynamically creates a filter class with all filter options as fastapi `Query` parameters.
 
@@ -430,8 +442,8 @@ class Filter(BaseModel):
 
         # compile filter options as pydantic fields
         for option in filter_options:
-            attributes[option.name] = option.field_info
-            attributes["__annotations__"][option.name] = option.field_type
+            attributes[option.name] = Field(option.query_parameter())
+            attributes["__annotations__"][option.name] = option.input_type()
 
         # dynamically create filter class
         return type(
@@ -446,9 +458,10 @@ def get_filter(
     include: str | Iterable[str] = (),
     exclude: str | Iterable[str] = (),
     include_related: Iterable[str] = (),
-) -> Type["Filter"]:
+) -> Type[Filter]:
     """
-    Dependency function to dynamically generate query parameters based of the given sqlalchemy model(s).
+    Dependency function to dynamically generate a query parameter class for filter options based on the given sqlalchemy model(s) and additional parameters.
+
     If `include` values are set, only these values are included in the output.
     If `exclude` values are set, they will be excluded from the returned output.
 
